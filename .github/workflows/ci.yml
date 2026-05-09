@@ -1,0 +1,128 @@
+name: CI - Duplicate Removal
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - "phase/**"
+      - "phase*"
+      - "phase-*"
+  pull_request:
+    branches:
+      - dev
+      - "phase/**"
+      - "phase*"
+      - "phase-*"
+
+jobs:
+  build-test:
+    name: Build, Test, and Run (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip list
+
+      - name: Basic validation
+        run: |
+          set -euxo pipefail
+          python -m compileall -q src tests
+
+      - name: Run tests
+        run: |
+          set -euxo pipefail
+          pytest -vv -ra --showlocals --durations=10 -s
+
+      - name: Validate raw dataset is present and non-empty
+        run: |
+          set -euxo pipefail
+          if [ ! -s data/raw/dataset.csv ]; then
+            echo "data/raw/dataset.csv is missing or empty. Add a valid raw dataset." >&2
+            exit 1
+          fi
+
+      - name: Inspect dataset before processing
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import os
+          import pandas as pd
+          path = 'data/raw/dataset.csv'
+          if not os.path.exists(path) or os.path.getsize(path) == 0:
+              print(f'Skipping preview, file missing or empty: {path}')
+          else:
+              df = pd.read_csv(path)
+              print('Rows before:', len(df))
+              print('Duplicate rows before:', int(df.duplicated().sum()))
+              print(df.head(3).to_string(index=False))
+          PY
+
+      - name: Execute duplicate removal pipeline
+        run: |
+          set -euxo pipefail
+          python -m src.duplicate_removal
+
+      - name: Inspect dataset after processing
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import os
+          import pandas as pd
+          path = 'data/process/dataset.csv'
+          if not os.path.exists(path) or os.path.getsize(path) == 0:
+              print(f'Skipping preview, file missing or empty: {path}')
+          else:
+              df = pd.read_csv(path)
+              print('Rows after:', len(df))
+              print('Duplicate rows after:', int(df.duplicated().sum()))
+              print(df.head(3).to_string(index=False))
+          PY
+
+      - name: Verify output exists
+        run: |
+          set -euxo pipefail
+          test -f data/process/dataset.csv
+
+      - name: Upload processed dataset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-dataset-${{ matrix.python-version }}
+          path: data/process/dataset.csv
+          retention-days: 7
+
+      - name: Commit processed dataset to repo
+        if: ${{ github.event_name == 'push' && matrix.python-version == '3.10' }}
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/process/*.csv
+          if git diff --cached --quiet; then
+            echo "No processed dataset changes to commit."
+            exit 0
+          fi
+          git commit -m "chore(data): update processed dataset [skip ci]"
+          git push
+
+      - name: Success message
+        run: |
+          echo "CI/CD completed successfully for Python ${{ matrix.python-version }}"
